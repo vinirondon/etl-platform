@@ -35,17 +35,7 @@ export const companiesAPI = {
     linkUser: (id, uid) => api.post(`/companies/${id}/users`, { user_id: uid }),
     unlinkUser: (id, uid) => api.delete(`/companies/${id}/users/${uid}`),
 };
-export const integrationsAPI = {
-    list: (p) => api.get('/integrations', { params: p }),
-    get: (id) => api.get(`/integrations/${id}`),
-    create: (d) => api.post('/integrations', d),
-    update: (id, d) => api.put(`/integrations/${id}`, d),
-    delete: (id) => api.delete(`/integrations/${id}`),
-    targets: (p) => api.get('/integrations/targets/all', { params: p }),
-    createTarget: (d) => api.post('/integrations/targets', d),
-    deleteTarget: (id) => api.delete(`/integrations/targets/${id}`),
-    testTarget: (id) => api.post(`/integrations/targets/${id}/test`),
-};
+
 export const schedulesAPI = {
     list: () => api.get('/schedules'),
     presets: () => api.get('/schedules/presets'),
@@ -69,4 +59,18 @@ export const usersAPI = {
     update: (id, d) => api.put(`/users/${id}`, d),
     delete: (id) => api.delete(`/users/${id}`),
 };
+export const integrationsAPI = {
+    list: (p) => api.get('/integrations', { params: p }),
+    get: (id) => api.get(`/integrations/${id}`),
+    create: (d) => api.post('/integrations', d),
+    update: (id, d) => api.put(`/integrations/${id}`, d),
+    delete: (id) => api.delete(`/integrations/${id}`),
+    targets: (p) => api.get('/integrations/targets/all', { params: p }),
+    createTarget: (d) => api.post('/integrations/targets', d),
+    updateTarget: (id, d) => api.put(`/integrations/targets/${id}`, d),
+    deleteTarget: (id) => api.delete(`/integrations/targets/${id}`),
+    testTarget: (id) => api.post(`/integrations/targets/${id}/test`),
+    linkTarget: (d) => api.post('/integrations/targets/link', d),
+};
+
 export default api;

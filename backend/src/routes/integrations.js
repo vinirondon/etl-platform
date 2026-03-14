@@ -231,4 +231,51 @@ router.post('/targets/:id/test', authenticate, async (req, res) => {
     }
 });
 
+router.post('/targets/link', authenticate, requireRole('superadmin', 'admin'), async (req, res) => {
+    try {
+        const { company_id, target_id, name } = req.body;
+        if (!company_id || !target_id || !name)
+            return res.status(400).json({ error: 'company_id, target_id and name required' });
+
+        // Busca o banco original para copiar as credenciais
+        const original = await getAsync('SELECT * FROM etl.database_targets WHERE id = ?', [target_id]);
+        if (!original) return res.status(404).json({ error: 'Banco de origem não encontrado' });
+
+        // Cria um novo registro apontando para o mesmo host/banco mas vinculado à nova empresa
+        const id = uuidv4();
+        await runAsync(
+            `INSERT INTO etl.database_targets
+        (id, company_id, name, type, host, port, database_name, username, password_encrypted, options, is_linked, linked_from_id)
+       VALUES (?,?,?,?,?,?,?,?,?,?,1,?)`,
+            [id, company_id, name, original.type, original.host, original.port,
+                original.database_name, original.username, original.password_encrypted,
+                original.options || null, target_id]
+        );
+        await logAudit({ userId: req.user.id, userEmail: req.user.email, action: 'LINK_DB_TARGET', resourceType: 'database_target', resourceId: id, ip: req.ip });
+        res.status(201).json({ id, name });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.put('/targets/:id', authenticate, requireRole('superadmin', 'admin'), async (req, res) => {
+    try {
+        const { name, host, port, database_name, username, password } = req.body;
+        const updates = [name, host, port, database_name, username];
+
+        if (password) {
+            const encPwd = encrypt(password);
+            await runAsync(
+                `UPDATE etl.database_targets SET name=?, host=?, port=?, database_name=?, username=?, password_encrypted=?, updated_at=GETDATE() WHERE id=?`,
+                [...updates, encPwd, req.params.id]
+            );
+        } else {
+            await runAsync(
+                `UPDATE etl.database_targets SET name=?, host=?, port=?, database_name=?, username=?, updated_at=GETDATE() WHERE id=?`,
+                [...updates, req.params.id]
+            );
+        }
+        res.json({ message: 'Target updated' });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+
 module.exports = router;
