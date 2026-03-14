@@ -14,6 +14,7 @@ const https   = require('https');
 const { v4: uuidv4 } = require('uuid');
 const { getAsync, allAsync, runAsync, getPool } = require('../models/database');
 const { decrypt } = require('../utils/encrypt');
+const mssql = require('mssql');  // ← adicione esta linha
 
 // ── XML helper ───────────────────────────────────────────────────────────────
 function parseXml(xmlString) {
@@ -161,74 +162,108 @@ async function addMissingColumns(targetPool, schema, table, sampleRecord) {
 }
 
 // ── Upsert records into target SQL Server table ──────────────────────────────
-async function upsertRecords(targetPool, tableName, records, dedupField, integrationId, companyId, batchId) {
-  if (!records.length) return { inserted: 0, updated: 0, skipped: 0 };
-  const { schema, table } = parseTableName(tableName);
-  let inserted = 0, updated = 0, skipped = 0;
-  const now = new Date().toISOString();
 
-  for (const record of records) {
-    try {
-      const hash = crypto.createHash('md5').update(JSON.stringify(record)).digest('hex');
+async function upsertRecords(targetPool, tableName, records, dedupField, integrationId, companyId, batchId, deleteBeforeInsert = false) {
+    if (!records.length) return { inserted: 0, updated: 0, skipped: 0 };
+    const { schema, table } = parseTableName(tableName);
+    const now = new Date().toISOString();
 
-      // Sanitize keys: replace non-word chars with underscore
-      const sanitized = {};
-      Object.entries(record).forEach(([k, v]) => {
-        sanitized[k.replace(/[^\w]/g, '_')] = v != null ? String(v) : null;
-      });
+    // 1. Prepara todos os registros em memória
+    const metaRecords = records.map(record => {
+        const hash = crypto.createHash('md5').update(JSON.stringify(record)).digest('hex');
+        const sanitized = {};
+        Object.entries(record).forEach(([k, v]) => {
+            sanitized[k.replace(/[^\w]/g, '_')] = v != null ? String(v) : null;
+        });
+        return {
+            ...sanitized,
+            _etl_id_empresa: String(companyId),
+            _etl_id_integracao: String(integrationId),
+            _etl_batch_id: String(batchId),
+            _etl_data_execucao: now,
+            _etl_hash: hash,
+            _etl_origem: 'api',
+        };
+    });
 
-      const metaRecord = {
-        ...sanitized,
-        _etl_id_empresa:    companyId,
-        _etl_id_integracao: integrationId,
-        _etl_batch_id:      batchId,
-        _etl_data_execucao: now,
-        _etl_hash:          hash,
-        _etl_origem:        'api',
-      };
+    const allCols = [...new Set(metaRecords.flatMap(r => Object.keys(r)))];
+    const dedupSafe = dedupField ? dedupField.replace(/[^\w]/g, '_') : null;
+    const stagingTable = `#etl_staging_${batchId.replace(/-/g, '')}`;
 
-      // Check for duplicate if dedup field is set
-      const dedupSafe = dedupField ? dedupField.replace(/[^\w]/g, '_') : null;
-      const dedupVal  = dedupSafe ? sanitized[dedupSafe] ?? record[dedupField] : null;
-
-      if (dedupSafe && dedupVal != null) {
-        const checkReq = targetPool.request().input('dv', dedupVal);
-        const checkResult = await checkReq.query(
-          `SELECT COUNT(*) AS cnt FROM [${schema}].[${table}] WHERE [${dedupSafe}] = @dv`
-        );
-        if (checkResult.recordset[0].cnt > 0) {
-          // UPDATE
-          const req = targetPool.request();
-          const setClauses = Object.entries(metaRecord)
-            .filter(([k]) => k !== dedupSafe)
-            .map(([k], i) => { req.input(`u${i}`, metaRecord[k]); return `[${k}] = @u${i}`; })
-            .join(', ');
-          req.input('dv2', dedupVal);
-          await req.query(
-            `UPDATE [${schema}].[${table}]
-             SET ${setClauses}, [_etl_data_update] = GETDATE()
-             WHERE [${dedupSafe}] = @dv2`
-          );
-          updated++;
-          continue;
-        }
-      }
-
-      // INSERT
-      const req = targetPool.request();
-      const cols = Object.keys(metaRecord).map(k => `[${k}]`).join(', ');
-      const vals = Object.keys(metaRecord).map((k, i) => { req.input(`i${i}`, metaRecord[k]); return `@i${i}`; }).join(', ');
-      await req.query(`INSERT INTO [${schema}].[${table}] (${cols}) VALUES (${vals})`);
-      inserted++;
-
-    } catch (rowErr) {
-      console.error(`  Row error: ${rowErr.message}`);
-      skipped++;
+    // 2. DELETE por empresa antes de inserir (se ativado)
+    if (deleteBeforeInsert) {
+        await targetPool.request()
+            .input('companyId', mssql.NVarChar, String(companyId))
+            .query(`DELETE FROM [${schema}].[${table}] WHERE [_etl_id_empresa] = @companyId`);
+        console.log(`  🗑️  Deleted existing records for company ${companyId} from [${schema}].[${table}]`);
     }
-  }
 
-  return { inserted, updated, skipped };
+    // 3. Cria tabela temporária de staging
+    const colDefs = allCols.map(c => `[${c}] NVARCHAR(MAX)`).join(', ');
+    await targetPool.request().batch(
+        `IF OBJECT_ID('tempdb..${stagingTable}') IS NOT NULL DROP TABLE ${stagingTable};
+     CREATE TABLE ${stagingTable} (${colDefs});`
+    );
+
+    // 4. BulkLoad para o staging (sem limite de parâmetros, usa protocolo TDS)
+    const bulkTable = new mssql.Table(stagingTable);
+    bulkTable.create = false;
+
+    allCols.forEach(col => {
+        bulkTable.columns.add(col, mssql.NVarChar(mssql.MAX), { nullable: true });
+    });
+
+    metaRecords.forEach(row => {
+        bulkTable.rows.add(...allCols.map(col => row[col] ?? null));
+    });
+
+    await targetPool.request().bulk(bulkTable);
+
+    // 5. INSERT ou MERGE do staging para a tabela final
+    let inserted = 0, updated = 0;
+
+    if (deleteBeforeInsert || !dedupSafe) {
+        // Após delete, só insere — não precisa de MERGE
+        const insertCols = allCols.map(c => `[${c}]`).join(', ');
+        const result = await targetPool.request().query(
+            `INSERT INTO [${schema}].[${table}] (${insertCols})
+       SELECT ${insertCols} FROM ${stagingTable};
+       SELECT @@ROWCOUNT AS cnt;`
+        );
+        inserted = result.recordset?.[0]?.cnt ?? metaRecords.length;
+    } else {
+        // MERGE com deduplicação (quando não usa delete)
+        const updateCols = allCols.filter(c => c !== dedupSafe);
+        const updateSet = updateCols.map(c => `t.[${c}] = s.[${c}]`).join(', ');
+        const insertCols = allCols.map(c => `[${c}]`).join(', ');
+        const insertVals = allCols.map(c => `s.[${c}]`).join(', ');
+
+        const mergeResult = await targetPool.request().batch(`
+      DECLARE @counts TABLE (action NVARCHAR(10));
+
+      MERGE [${schema}].[${table}] AS t
+      USING ${stagingTable} AS s ON t.[${dedupSafe}] = s.[${dedupSafe}]
+      WHEN MATCHED THEN
+        UPDATE SET ${updateSet}, t.[_etl_data_update] = GETDATE()
+      WHEN NOT MATCHED THEN
+        INSERT (${insertCols}) VALUES (${insertVals})
+      OUTPUT $action INTO @counts;
+
+      SELECT action, COUNT(*) AS cnt FROM @counts GROUP BY action;
+    `);
+
+        mergeResult.recordset?.forEach(row => {
+            if (row.action === 'INSERT') inserted = row.cnt;
+            if (row.action === 'UPDATE') updated = row.cnt;
+        });
+    }
+
+    // 6. Limpa staging
+    await targetPool.request().batch(`DROP TABLE IF EXISTS ${stagingTable}`);
+
+    return { inserted, updated, skipped: 0 };
 }
+
 
 // ── Main runner ──────────────────────────────────────────────────────────────
 async function runIntegration(integrationId, triggeredBy = null, triggerType = 'scheduled') {
@@ -338,10 +373,11 @@ async function runIntegration(integrationId, triggeredBy = null, triggerType = '
           // Auto-create or update table structure
           await ensureTable(targetPool, integration.target_table, processedRecords[0]);
 
-          const result = await upsertRecords(
-            targetPool, integration.target_table, processedRecords,
-            integration.dedup_field, integrationId, companyId, batchId
-          );
+        const result = await upsertRecords(
+                targetPool, integration.target_table, processedRecords,
+                integration.dedup_field, integrationId, companyId, batchId,
+                integration.delete_before_insert === 1 || integration.delete_before_insert === true
+        );;
           recordsInserted = result.inserted;
           recordsUpdated  = result.updated;
           recordsSkipped  = result.skipped;

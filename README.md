@@ -71,8 +71,3 @@ etl-platform/
 - `_etl_data_insercao` — Timestamp de inserção
 - `_etl_hash` — Hash MD5 do registro
 - `_etl_origem` — Origem (api)
-
-
--- ''testestestets
-
-oioioi
