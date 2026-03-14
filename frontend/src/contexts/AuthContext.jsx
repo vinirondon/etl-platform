@@ -22,6 +22,7 @@ export function AuthProvider({ children }) {
     }
   }, []);
 
+
   const login = async (email, password) => {
     const res = await authAPI.login({ email, password });
     localStorage.setItem('etl_token', res.data.token);
