@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  backend:
+    build: ./backend
+    container_name: etl-backend
+    ports:
+      - "3001:3001"
+    volumes:
+      - etl-data:/app/data
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+      - JWT_SECRET=${JWT_SECRET:-etl_change_this_in_production_jwt_secret}
+      - JWT_EXPIRES_IN=24h
+      - SQLITE_PATH=/app/data/etl_platform.db
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-etl_32char_encrypt_key_change_me!}
+      - ADMIN_EMAIL=${ADMIN_EMAIL:-admin@etlplatform.com}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-Admin@123456}
+      - FRONTEND_URL=http://localhost:5173
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    container_name: etl-frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  etl-data:
